@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini PDF Studio</title>
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Dependencies -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #1e293b;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 10px;
+        }
+
+        .canvas-container {
+            position: relative;
+            cursor: crosshair;
+        }
+
+        .selection-rect {
+            position: absolute;
+            border: 2px dashed #38bdf8;
+            background: rgba(56, 189, 248, 0.2);
+            pointer-events: none;
+        }
+
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: #38bdf8;
+            box-shadow: 0 0 0 1px #38bdf8;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        // Initialize PDF.js Worker
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+        const MODEL_NAME = "gemini-3.1-pro-preview";
+
+        const App = () => {
+            // App State
+            const [apiKey, setApiKey] = useState(''); // Managed by user for security
+            const [mode, setMode] = useState('word'); // 'word' or 'sentence'
+            const [inputType, setInputType] = useState('ocr'); // 'ocr' (image) or 'text' (direct)
+            const [images, setImages] = useState([]); // Base64 images
+            const [texts, setTexts] = useState([]); // Extracted text per page
+            const [currentIndex, setCurrentIndex] = useState(0);
+            const [results, setResults] = useState([]);
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [isFileLoading, setIsFileLoading] = useState(false);
+            const [progress, setProgress] = useState(0);
+            
+            // Selection/Crop State
+            const [isSelecting, setIsSelecting] = useState(false);
+            const [selection, setSelection] = useState(null);
+            const canvasRef = useRef(null);
+
+            // --- PDF Processing ---
+            const handleFileChange = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                setIsFileLoading(true);
+                setImages([]);
+                setTexts([]);
+                setCurrentIndex(0);
+
+                if (file.type === "application/pdf") {
+                    const reader = new FileReader();
+                    reader.onload = async (event) => {
+                        const typedarray = new Uint8Array(event.target.result);
+                        try {
+                            const pdf = await pdfjsLib.getDocument(typedarray).promise;
+                            const pageImages = [];
+                            const pageTexts = [];
+                            
+                            for (let i = 1; i <= pdf.numPages; i++) {
+                                const page = await pdf.getPage(i);
+                                const viewport = page.getViewport({ scale: 2.0 });
+                                const canvas = document.createElement('canvas');
+                                const context = canvas.getContext('2d');
+                                canvas.height = viewport.height;
+                                canvas.width = viewport.width;
+                                
+                                await page.render({ canvasContext: context, viewport }).promise;
+                                pageImages.push(canvas.toDataURL('image/jpeg', 0.85));
+
+                                const textContent = await page.getTextContent();
+                                const pageString = textContent.items.map(item => item.str).join(' ');
+                                pageTexts.push(pageString);
+                            }
+                            setImages(pageImages);
+                            setTexts(pageTexts);
+                        } catch (err) {
+                            console.error("PDF Parsing Error:", err);
+                        } finally {
+                            setIsFileLoading(false);
+                        }
+                    };
+                    reader.readAsArrayBuffer(file);
+                } else {
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        setImages([event.target.result]);
+                        setTexts([""]);
+                        setInputType('ocr');
+                        setIsFileLoading(false);
+                    };
+                    reader.readAsDataURL(file);
+                }
+            };
+
+            // --- Gemini API Call with Exponential Backoff ---
+            const fetchGemini = async (parts, systemPrompt, responseSchema) => {
+                if (!apiKey) {
+                    alert("Please enter your Gemini API Key in the top header.");
+                    throw new Error("API Key missing");
+                }
+
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${apiKey}`;
+                
+                const payload = {
+                    contents: [{ parts }],
+                    systemInstruction: { parts: [{ text: systemPrompt }] },
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: responseSchema
+                    }
+                };
+
+                let delay = 1000;
+                for (let i = 0; i < 5; i++) {
+                    try {
+                        const response = await fetch(url, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        });
+
+                        if (response.status === 404) {
+                            throw new Error("API Endpoint Not Found (404). Check if the model name is correct for your region.");
+                        }
+
+                        if (!response.ok) {
+                            const errorData = await response.json();
+                            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+                        }
+
+                        const result = await response.json();
+                        const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                        return JSON.parse(text);
+                    } catch (error) {
+                        if (i === 4) throw error;
+                        await new Promise(r => setTimeout(r, delay));
+                        delay *= 2;
+                    }
+                }
+            };
+
+            const getSystemPrompt = () => {
+                if (mode === 'word') {
+                    return "Extract key vocabulary from the provided input. Provide the word, part of speech (POS), a natural Korean translation, and an English example sentence (polite Korean translation included in the example sentence field). Wrap the target word in the example sentence with curly brackets {}.";
+                }
+                return "Extract full sentences from the provided input. Provide the original English sentence and a natural, polite Korean translation (해요체).";
+            };
+
+            const getSchema = () => {
+                if (mode === 'word') {
+                    return {
+                        type: "ARRAY",
+                        items: {
+                            type: "OBJECT",
+                            properties: {
+                                word: { type: "STRING" },
+                                pos: { type: "STRING" },
+                                translation: { type: "STRING" },
+                                example: { type: "STRING" }
+                            },
+                            required: ["word", "pos", "translation", "example"]
+                        }
+                    };
+                }
+                return {
+                    type: "ARRAY",
+                    items: {
+                        type: "OBJECT",
+                        properties: {
+                            sentence: { type: "STRING" },
+                            translation: { type: "STRING" }
+                        },
+                        required: ["sentence", "translation"]
+                    }
+                };
+            };
+
+            const processSingle = async () => {
+                if (!images[currentIndex] && !texts[currentIndex]) return;
+                setIsProcessing(true);
+
+                try {
+                    let parts = [];
+                    if (inputType === 'text' && texts[currentIndex]) {
+                        parts.push({ text: texts[currentIndex] });
+                    } else {
+                        const base64 = images[currentIndex].split(',')[1];
+                        parts.push({ inlineData: { mimeType: "image/jpeg", data: base64 } });
+                    }
+
+                    const data = await fetchGemini(parts, getSystemPrompt(), getSchema());
+                    if (data) setResults(prev => [...prev, ...data]);
+                } catch (error) {
+                    console.error(error);
+                } finally {
+                    setIsProcessing(false);
+                }
+            };
+
+            const processBulk = async () => {
+                setIsProcessing(true);
+                try {
+                    for (let i = 0; i < images.length; i++) {
+                        setProgress(Math.round(((i + 1) / images.length) * 100));
+                        let parts = [];
+                        if (inputType === 'text' && texts[i]) {
+                            parts.push({ text: texts[i] });
+                        } else {
+                            const base64 = images[i].split(',')[1];
+                            parts.push({ inlineData: { mimeType: "image/jpeg", data: base64 } });
+                        }
+                        const data = await fetchGemini(parts, getSystemPrompt(), getSchema());
+                        if (data) setResults(prev => [...prev, ...data]);
+                    }
+                } catch (error) {
+                    console.error(error);
+                } finally {
+                    setIsProcessing(false);
+                    setProgress(0);
+                }
+            };
+
+            const startSelection = (e) => {
+                if (inputType === 'text' || isProcessing) return;
+                const rect = e.target.getBoundingClientRect();
+                setIsSelecting(true);
+                setSelection({
+                    startX: e.clientX - rect.left,
+                    startY: e.clientY - rect.top,
+                    endX: e.clientX - rect.left,
+                    endY: e.clientY - rect.top
+                });
+            };
+
+            const updateSelection = (e) => {
+                if (!isSelecting) return;
+                const rect = canvasRef.current.getBoundingClientRect();
+                setSelection(prev => ({
+                    ...prev,
+                    endX: e.clientX - rect.left,
+                    endY: e.clientY - rect.top
+                }));
+            };
+
+            const endSelection = async () => {
+                if (!isSelecting || !selection) return;
+                setIsSelecting(false);
+
+                const width = Math.abs(selection.endX - selection.startX);
+                const height = Math.abs(selection.endY - selection.startY);
+
+                if (width < 10 || height < 10) {
+                    setSelection(null);
+                    return;
+                }
+
+                const originalImg = new Image();
+                originalImg.src = images[currentIndex];
+                originalImg.onload = async () => {
+                    const cropCanvas = document.createElement('canvas');
+                    const ctx = cropCanvas.getContext('2d');
+                    const scaleX = originalImg.width / canvasRef.current.offsetWidth;
+                    const scaleY = originalImg.height / canvasRef.current.offsetHeight;
+
+                    cropCanvas.width = width * scaleX;
+                    cropCanvas.height = height * scaleY;
+
+                    ctx.drawImage(
+                        originalImg,
+                        Math.min(selection.startX, selection.endX) * scaleX,
+                        Math.min(selection.startY, selection.endY) * scaleY,
+                        width * scaleX,
+                        height * scaleY,
+                        0, 0, width * scaleX, height * scaleY
+                    );
+
+                    setIsProcessing(true);
+                    try {
+                        const parts = [{ inlineData: { mimeType: "image/jpeg", data: cropCanvas.toDataURL('image/jpeg').split(',')[1] } }];
+                        const data = await fetchGemini(parts, getSystemPrompt(), getSchema());
+                        if (data) setResults(prev => [...prev, ...data]);
+                    } catch (err) {
+                        console.error(err);
+                    } finally {
+                        setIsProcessing(false);
+                        setSelection(null);
+                    }
+                };
+            };
+
+            const updateRow = (idx, field, value) => {
+                const newResults = [...results];
+                newResults[idx][field] = value;
+                setResults(newResults);
+            };
+
+            const removeRow = (idx) => {
+                setResults(results.filter((_, i) => i !== idx));
+            };
+
+            const exportToExcel = () => {
+                const ws = XLSX.utils.json_to_sheet(results);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "OCR_Results");
+                XLSX.writeFile(wb, `OCR_Extract_${new Date().getTime()}.xlsx`);
+            };
+
+            return (
+                <div className="flex flex-col h-screen overflow-hidden">
+                    <header className="h-16 bg-[#1e293b] border-b border-slate-700 flex items-center px-6 justify-between shrink-0">
+                        <div className="flex items-center gap-6">
+                            <div className="flex items-center gap-2">
+                                <i className="fas fa-brain text-sky-400 text-xl"></i>
+                                <h1 className="font-bold text-lg tracking-tight uppercase">GEMINI PDF STUDIO</h1>
+                            </div>
+                            <input 
+                                type="password" 
+                                placeholder="Gemini API Key" 
+                                className="bg-slate-900 border border-slate-700 rounded-md px-3 py-1.5 text-xs w-64 focus:ring-1 focus:ring-sky-500 transition-all text-slate-200"
+                                value={apiKey}
+                                onChange={(e) => setApiKey(e.target.value)}
+                            />
+                        </div>
+
+                        <div className="flex items-center gap-4">
+                            <div className="bg-slate-900 border border-slate-700 rounded-md flex p-1">
+                                <button 
+                                    onClick={() => setInputType('ocr')}
+                                    className={`px-3 py-1 text-[9px] uppercase font-black rounded transition-all ${inputType === 'ocr' ? 'bg-amber-500 text-white' : 'text-slate-500 hover:text-white'}`}
+                                >OCR Mode</button>
+                                <button 
+                                    onClick={() => setInputType('text')}
+                                    className={`px-3 py-1 text-[9px] uppercase font-black rounded transition-all ${inputType === 'text' ? 'bg-indigo-500 text-white' : 'text-slate-500 hover:text-white'}`}
+                                >Direct Text</button>
+                            </div>
+
+                            <div className="bg-slate-900 border border-slate-700 rounded-md flex p-1">
+                                <button 
+                                    onClick={() => setMode('word')}
+                                    className={`px-3 py-1 text-[9px] uppercase font-black rounded transition-all ${mode === 'word' ? 'bg-sky-500 text-white' : 'text-slate-400 hover:text-white'}`}
+                                >Word</button>
+                                <button 
+                                    onClick={() => setMode('sentence')}
+                                    className={`px-3 py-1 text-[9px] uppercase font-black rounded transition-all ${mode === 'sentence' ? 'bg-sky-500 text-white' : 'text-slate-400 hover:text-white'}`}
+                                >Sentence</button>
+                            </div>
+
+                            <label className="bg-white text-black text-[10px] font-bold px-4 py-2 rounded cursor-pointer hover:bg-slate-200 transition-colors uppercase tracking-wider">
+                                <i className="fas fa-plus-circle mr-2"></i> LOAD
+                                <input type="file" className="hidden" onChange={handleFileChange} accept="application/pdf,image/*" />
+                            </label>
+
+                            <button 
+                                onClick={processBulk}
+                                disabled={isProcessing || images.length === 0}
+                                className="bg-sky-500 text-white text-[10px] font-bold px-4 py-2 rounded hover:bg-sky-400 disabled:opacity-50 transition-colors uppercase tracking-wider"
+                            >
+                                <i className="fas fa-magic mr-2"></i> BULK SCAN
+                            </button>
+                        </div>
+                    </header>
+
+                    <main className="flex flex-1 overflow-hidden">
+                        <section className="w-[45%] border-r border-slate-700 flex flex-col bg-[#0f172a]">
+                            <div className="p-3 bg-slate-800/50 border-b border-slate-700 flex justify-between items-center shrink-0">
+                                <div className="flex gap-2">
+                                    <button 
+                                        onClick={() => setCurrentIndex(Math.max(0, currentIndex - 1))}
+                                        className="w-8 h-8 rounded bg-slate-700 hover:bg-slate-600 flex items-center justify-center transition-colors"
+                                    ><i className="fas fa-arrow-left text-xs"></i></button>
+                                    <span className="flex items-center px-3 text-[11px] font-bold text-slate-400 bg-slate-900 rounded border border-slate-700">
+                                        {images.length > 0 ? currentIndex + 1 : 0} / {images.length}
+                                    </span>
+                                    <button 
+                                        onClick={() => setCurrentIndex(Math.min(images.length - 1, currentIndex + 1))}
+                                        className="w-8 h-8 rounded bg-slate-700 hover:bg-slate-600 flex items-center justify-center transition-colors"
+                                    ><i className="fas fa-arrow-right text-xs"></i></button>
+                                </div>
+                                <button 
+                                    onClick={processSingle}
+                                    disabled={isProcessing || images.length === 0}
+                                    className="px-4 py-1.5 rounded bg-emerald-600 hover:bg-emerald-500 text-[10px] font-black uppercase transition-colors disabled:opacity-50"
+                                >SCAN PAGE</button>
+                            </div>
+
+                            <div className="flex-1 overflow-auto p-8 custom-scrollbar flex items-start justify-center bg-[#0a0f1c] relative">
+                                {isFileLoading ? (
+                                    <div className="flex flex-col items-center justify-center h-full text-sky-400 gap-4">
+                                        <div className="w-10 h-10 border-2 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
+                                        <p className="text-[10px] font-black tracking-widest uppercase">Initializing Document...</p>
+                                    </div>
+                                ) : images.length > 0 ? (
+                                    <div 
+                                        className={`canvas-container shadow-2xl rounded ${inputType === 'text' ? 'cursor-text select-text' : 'cursor-crosshair'}`}
+                                        onMouseDown={startSelection}
+                                        onMouseMove={updateSelection}
+                                        onMouseUp={endSelection}
+                                        ref={canvasRef}
+                                    >
+                                        <img 
+                                            src={images[currentIndex]} 
+                                            className="max-w-full pointer-events-none select-none border border-slate-700 rounded shadow-2xl"
+                                            alt="Preview" 
+                                        />
+                                        {selection && (
+                                            <div 
+                                                className="selection-rect shadow-[0_0_0_9999px_rgba(0,0,0,0.4)]"
+                                                style={{
+                                                    left: Math.min(selection.startX, selection.endX),
+                                                    top: Math.min(selection.startY, selection.endY),
+                                                    width: Math.abs(selection.endX - selection.startX),
+                                                    height: Math.abs(selection.endY - selection.startY)
+                                                }}
+                                            />
+                                        )}
+                                        {isProcessing && (
+                                            <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px] flex flex-col items-center justify-center z-50">
+                                                <div className="w-12 h-12 border-4 border-sky-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+                                                <p className="text-[10px] font-black text-sky-400 tracking-[0.2em] uppercase">Processing with Gemini...</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="flex flex-col items-center justify-center h-full text-slate-700 gap-6 opacity-40">
+                                        <i className="fas fa-file-pdf text-6xl"></i>
+                                        <p className="text-xs font-bold uppercase tracking-widest">Awaiting PDF or Image</p>
+                                    </div>
+                                )}
+                            </div>
+                            
+                            {progress > 0 && (
+                                <div className="h-1 bg-slate-800">
+                                    <div className="h-full bg-sky-500 transition-all duration-300 shadow-[0_0_10px_#38bdf8]" style={{ width: `${progress}%` }}></div>
+                                </div>
+                            )}
+                        </section>
+
+                        <section className="w-[55%] flex flex-col bg-[#0f172a] shadow-[-10px_0_30px_rgba(0,0,0,0.3)] z-10">
+                            <div className="p-3 bg-slate-800/50 border-b border-slate-700 flex justify-between items-center shrink-0 px-6">
+                                <span className="text-[10px] uppercase tracking-widest font-black text-slate-500">Workspace / {results.length} Entries</span>
+                                <div className="flex gap-4">
+                                    <button onClick={() => setResults([])} className="text-[10px] text-rose-500 hover:text-rose-400 font-black uppercase">Clear</button>
+                                    <button onClick={exportToExcel} className="bg-emerald-600 text-white px-4 py-1.5 rounded text-[10px] font-black uppercase hover:bg-emerald-500"><i className="fas fa-file-excel mr-2"></i> Export Excel</button>
+                                </div>
+                            </div>
+
+                            <div className="flex-1 overflow-auto custom-scrollbar">
+                                <table className="w-full text-left border-collapse">
+                                    <thead className="sticky top-0 bg-[#1e293b] border-b border-slate-700 z-20 shadow-lg">
+                                        <tr className="text-[9px] uppercase font-black text-slate-400 tracking-wider">
+                                            {mode === 'word' ? (
+                                                <>
+                                                    <th className="px-6 py-4 w-40">Term / POS</th>
+                                                    <th className="px-6 py-4 w-48">Translation</th>
+                                                    <th className="px-6 py-4">Example Sentence</th>
+                                                    <th className="px-2 py-4 w-12"></th>
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <th className="px-6 py-4">Original (EN)</th>
+                                                    <th className="px-6 py-4">Translation (KR)</th>
+                                                    <th className="px-2 py-4 w-12"></th>
+                                                </>
+                                            )}
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-800/50">
+                                        {results.map((row, idx) => (
+                                            <tr key={idx} className="group hover:bg-slate-800/40">
+                                                {mode === 'word' ? (
+                                                    <>
+                                                        <td className="px-6 py-4 align-top">
+                                                            <input className="w-full bg-transparent font-black text-sky-400 text-sm mb-1" value={row.word} onChange={(e) => updateRow(idx, 'word', e.target.value)} />
+                                                            <input className="w-full bg-transparent text-[9px] uppercase font-bold text-slate-500" value={row.pos} onChange={(e) => updateRow(idx, 'pos', e.target.value)} />
+                                                        </td>
+                                                        <td className="px-6 py-4 align-top">
+                                                            <input className="w-full bg-transparent text-sm text-slate-200" value={row.translation} onChange={(e) => updateRow(idx, 'translation', e.target.value)} />
+                                                        </td>
+                                                        <td className="px-6 py-4 align-top">
+                                                            <textarea className="w-full bg-transparent text-xs text-slate-400 resize-none h-16 leading-relaxed custom-scrollbar" value={row.example} onChange={(e) => updateRow(idx, 'example', e.target.value)} />
+                                                        </td>
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <td className="px-6 py-4 align-top">
+                                                            <textarea className="w-full bg-transparent text-xs font-medium text-sky-400/90 resize-none min-h-[80px] leading-relaxed custom-scrollbar" value={row.sentence} onChange={(e) => updateRow(idx, 'sentence', e.target.value)} />
+                                                        </td>
+                                                        <td className="px-6 py-4 align-top">
+                                                            <textarea className="w-full bg-transparent text-xs font-medium text-slate-200 resize-none min-h-[80px] leading-relaxed custom-scrollbar" value={row.translation} onChange={(e) => updateRow(idx, 'translation', e.target.value)} />
+                                                        </td>
+                                                    </>
+                                                )}
+                                                <td className="px-2 py-4 align-top opacity-0 group-hover:opacity-100">
+                                                    <button onClick={() => removeRow(idx)} className="text-slate-600 hover:text-rose-500 p-2"><i className="fas fa-times"></i></button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                        {results.length === 0 && (
+                                            <tr>
+                                                <td colSpan="4" className="py-32 text-center text-slate-700">
+                                                    <div className="flex flex-col items-center gap-3">
+                                                        <i className="fas fa-keyboard text-3xl opacity-20"></i>
+                                                        <p className="text-xs font-bold uppercase tracking-widest">Workspace is empty</p>
+                                                    </div>
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+                    </main>
+
+                    <footer className="h-8 bg-[#1e293b] border-t border-slate-700 px-6 flex items-center justify-between text-[9px] font-black text-slate-500 shrink-0 uppercase tracking-widest">
+                        <div className="flex gap-6 items-center">
+                            <span className="flex items-center gap-1.5"><div className={`w-1.5 h-1.5 rounded-full ${apiKey ? (isProcessing ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500') : 'bg-slate-700'}`}></div> {apiKey ? 'API KEY SET' : 'NO API KEY'}</span>
+                            <span className="opacity-30">|</span>
+                            <span>Model: {MODEL_NAME}</span>
+                        </div>
+                        <div>
+                            {isProcessing ? <span className="text-sky-400 animate-pulse">Request in Flight...</span> : <span>System Idle</span>}
+                        </div>
+                    </footer>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
